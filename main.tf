@@ -2,6 +2,11 @@ provider "aws" {
   region = var.region
 }
 
+///////////////////////
+//                   //
+// Presentation Tier //
+//                   //
+///////////////////////
 locals {
   s3_origin_id = "myS3Origin"
 
@@ -125,5 +130,47 @@ resource "aws_cloudfront_distribution" "s3_distribution" {
   viewer_certificate {
     cloudfront_default_certificate = true
   }
+}
+
+////////////////
+//            //
+// Logic Tier //
+//            //
+////////////////
+resource "aws_iam_role" "assume_role" {
+  name = "lambda access"
+
+  assume_role_policy = <<EOF
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": "sts:AssumeRole",
+        "Effect": "Allow",
+        "Sid" : "",
+        "Principal": {
+          "Service": "lambda.amazonaws.com"
+        }
+      }
+    ]
+  }
+  EOF
+}
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "${path.module}/logic/index.mjs" 
+  output_path = "${path.module}/lambda_function.zip"
+}
+
+resource "aws_lambda_function" "RetrieveUserData" {
+  filename = "${path.module}/lambda_function.zip"
+  function_name = "javascript_terraform_lambda"
+  role = aws_iam_role.assume_role.arn
+
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  
+  runtime          = "nodejs20.x"
+  handler          = "index.handler"
 }
 
