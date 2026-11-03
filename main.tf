@@ -47,33 +47,33 @@ resource "aws_s3_object" "website_files" {
 resource "aws_s3_bucket_policy" "AllowReadWrite" {
   bucket = aws_s3_bucket.this.id
   policy = <<EOF
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
 
-        "Principal": {
-          "Service": "cloudfront.amazonaws.com"
-        },
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
 
-        "Action": [
-          "s3:GetObject"
-        ],
+      "Action": [
+        "s3:GetObject"
+      ],
 
-        "Resource": [
-          "${aws_s3_bucket.this.arn}/*"
-        ],
+      "Resource": [
+        "${aws_s3_bucket.this.arn}/*"
+      ],
 
-        "Condition": {
-          "StringEquals": {
-            "AWS:SourceArn": "${aws_cloudfront_distribution.s3_distribution.arn}"
-          }
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "${aws_cloudfront_distribution.s3_distribution.arn}"
         }
       }
-    ] 
-  }
-  EOF
+    }
+  ] 
+}
+EOF
 }
 
 
@@ -137,40 +137,175 @@ resource "aws_cloudfront_distribution" "s3_distribution" {
 // Logic Tier //
 //            //
 ////////////////
-resource "aws_iam_role" "assume_role" {
-  name = "lambda access"
+
+// Retrieve data from database
+resource "aws_iam_role" "retrieve_from_database" {
+  name = "lambda_access_to_database"
 
   assume_role_policy = <<EOF
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Action": "sts:AssumeRole",
-        "Effect": "Allow",
-        "Sid" : "",
-        "Principal": {
-          "Service": "lambda.amazonaws.com"
-        }
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": "sts:AssumeRole",
+      "Effect": "Allow",
+      "Sid" : "",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
       }
-    ]
-  }
-  EOF
+    }
+  ]
+}
+EOF
 }
 
-data "archive_file" "lambda_zip" {
+resource "aws_iam_role_policy" "dynamodb_read_policy" {
+  name = "dynamodb_read_access"
+  role = aws_iam_role.retrieve_from_database.id
+
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": "${aws_dynamodb_table.userData.arn}"
+    }
+  ] 
+}
+EOF
+}
+
+
+data "archive_file" "retrieveUserData_zip" {
   type        = "zip"
-  source_file = "${path.module}/logic/index.mjs" 
-  output_path = "${path.module}/lambda_function.zip"
+  source_file = "${path.module}/logic/retrieveUserData.mjs" 
+  output_path = "${path.module}/retrieveUserData_function.zip"
 }
 
-resource "aws_lambda_function" "RetrieveUserData" {
-  filename = "${path.module}/lambda_function.zip"
-  function_name = "javascript_terraform_lambda"
-  role = aws_iam_role.assume_role.arn
+resource "aws_lambda_function" "RetrieveUserDatabase" {
+  filename = "${path.module}/retrieveUserData_function.zip"
+  function_name = "DatabaseRetrieve_terraform_lambda"
+  role = aws_iam_role.retrieve_from_database.arn
 
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  source_code_hash = data.archive_file.retrieveUserData_zip.output_base64sha256
   
   runtime          = "nodejs20.x"
-  handler          = "index.handler"
+  handler          = "retrieveUserData.handler"
 }
+
+
+// API Gateway
+resource "aws_api_gateway_rest_api" "api" {
+  name = "UserRequestAPI"
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
+  }
+}
+
+resource "aws_api_gateway_resource" "users" {
+  rest_api_id = aws_api_gateway_rest_api.api.id
+  parent_id   = aws_api_gateway_rest_api.api.root_resource_id
+  path_part   = "users"
+}
+
+resource "aws_api_gateway_method" "get_users" {
+  authorization = "NONE"
+  http_method   = "GET"
+  resource_id   = aws_api_gateway_resource.users.id
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+}
+
+resource "aws_api_gateway_integration" "lambda" {
+  http_method = aws_api_gateway_method.get_users.http_method
+  resource_id = aws_api_gateway_resource.users.id
+  rest_api_id = aws_api_gateway_rest_api.api.id
+  
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.RetrieveUserDatabase.invoke_arn
+}
+
+resource "aws_lambda_permission" "apigw" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.RetrieveUserDatabase.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
+}
+
+
+resource "aws_api_gateway_deployment" "this" {
+  rest_api_id = aws_api_gateway_rest_api.api.id
+
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_resource.users,
+      aws_api_gateway_method.get_users,
+      aws_api_gateway_integration.lambda,
+    ]))
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "dev" {
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+  deployment_id = aws_api_gateway_deployment.this.id
+  stage_name    = "dev"
+}
+
+output "api_url" {
+  value = "${aws_api_gateway_stage.dev.invoke_url}/users"
+}
+
+
+///////////////
+//           //
+// Data Tier //
+//           //
+///////////////
+
+// Dynamodb database
+resource "aws_dynamodb_table" "userData" {
+  name = "UserData"
+  hash_key = "userId"
+  read_capacity  = 10
+  write_capacity = 10
+
+  attribute {
+    name = "userId"
+    type = "S"
+  }
+
+  tags = {
+    Name        = "dynamodb-table-userData"
+    Environment = "dev"
+  }
+}
+
+resource "aws_dynamodb_table_item" "userExample" {
+  table_name = aws_dynamodb_table.userData.name
+  hash_key   = aws_dynamodb_table.userData.hash_key
+
+  item = <<ITEM
+{
+  "userId": {"S": "1"},
+  "name":   {"S": "Test User"},
+  "email":  {"S": "test@example.com"}
+}
+ITEM
+}
+
+
+
 

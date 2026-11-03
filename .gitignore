@@ -4,4 +4,5 @@
 *.tfvars
 crash.log
 
-variables.tf
+*.json
+*.zip
